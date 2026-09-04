@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "maf-harness-1170-sample"
 version = "0.1.0"
-description = "A resilient Microsoft Agent Framework 1.17.0 Harness Agent CLI sample"
+description = "A small stable-host-supervised Microsoft Agent Framework 1.17.0 Harness CLI sample"
 requires-python = ">=3.10"
 dependencies = [
   "agent-framework-core==1.17.0",
@@ -23,7 +23,7 @@ dev = [
 maf-harness = "harness_cli:main"
 
 [tool.hatch.build.targets.wheel]
-include = ["harness_cli.py"]
+include = ["harness_cli.py", "harness_agent.py", "harness_state.py"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
