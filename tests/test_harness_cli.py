@@ -9,13 +9,14 @@ import pytest
 
 from agent_framework import AgentSession, Content, Message
 
-from harness_cli import (
+import harness_cli
+from harness_agent import build_agent
+from harness_state import (
     COMPLETION_SOURCE_ID,
     REQUIRED_VERSIONS,
     Settings,
     active_task,
     begin_task,
-    build_agent,
     load_session,
     save_session,
     task_is_complete,
@@ -31,8 +32,7 @@ def make_settings(tmp_path: Path, base_url: str) -> Settings:
         client_kind="chat_completions",
         context_window_tokens=8_192,
         max_output_tokens=1_024,
-        loop_iterations_per_batch=4,
-        auto_batches_before_prompt=2,
+        supervisor_runs_before_prompt=12,
         api_retries=1,
         workspace=tmp_path / "workspace",
         checkpoint=tmp_path / ".state" / "session.json",
@@ -70,8 +70,8 @@ class MockChatHandler(BaseHTTPRequestHandler):
         type(self).request_count += 1
 
         if type(self).request_count == 1:
-            # A normal assistant answer ends the chat client's tool loop. The
-            # 1.17 Harness loop must autonomously invoke the agent again.
+            # A plain answer ends this Framework turn. The host supervisor must
+            # call agent.run again because the task_finish tool was not called.
             message = {"role": "assistant", "content": "I am still working."}
             finish_reason = "stop"
         elif type(self).request_count == 2:
@@ -147,7 +147,7 @@ class MockChatHandler(BaseHTTPRequestHandler):
 
 
 @pytest.mark.asyncio
-async def test_real_117_harness_loops_and_executes_completion_tool(
+async def test_host_supervisor_restarts_stable_harness_turn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -162,37 +162,33 @@ async def test_real_117_harness_loops_and_executes_completion_tool(
     try:
         host, port = server.server_address
         settings = make_settings(tmp_path, f"http://{host}:{port}/v1")
-        agent, _, _ = build_agent(settings)
+        agent, todo_provider, mode_provider = build_agent(settings)
         session = agent.create_session()
-        begin_task(session, "finish the mock task")
 
-        response = await agent.run("finish the mock task", session=session)
-        # Two HTTP requests prove loop_should_continue re-invoked the agent
-        # after the first plain-text response.
-        assert MockChatHandler.request_count == 2
-        assert len(response.user_input_requests) == 1
-        question = response.user_input_requests[0]
-        assert question.type == "function_call"
-        assert question.name == "ask_user"
+        async def answer_requests(requests: list[Content]) -> list[Message]:
+            replies: list[Message] = []
+            for request in requests:
+                if request.type == "function_call":
+                    replies.append(Message("tool", [Content.from_function_result(request.call_id, result="approved content")]))
+                else:
+                    replies.append(Message("user", [request.to_function_approval_response(True)]))
+            return replies
 
-        response = await agent.run(
-            [Message("tool", [Content.from_function_result(question.call_id, result="approved content")])],
+        monkeypatch.setattr(harness_cli, "collect_user_responses", answer_requests)
+        await harness_cli.run_task(
+            agent=agent,
+            todo_provider=todo_provider,
+            mode_provider=mode_provider,
             session=session,
-        )
-        assert len(response.user_input_requests) == 1
-        approval = response.user_input_requests[0]
-        assert approval.type == "function_approval_request"
-        assert approval.function_call.name == "workspace_write_text"
-
-        response = await agent.run(
-            [Message("user", [approval.to_function_approval_response(True)])],
-            session=session,
+            settings=settings,
+            task="finish the mock task",
         )
 
-        assert response.text == "Mock task complete."
         assert task_is_complete(session)
         assert session.state[COMPLETION_SOURCE_ID]["summary"] == "mock task verified"
         assert (settings.workspace / "result.txt").read_text(encoding="utf-8") == "approved content"
+        # Four host turns plus the final post-tool response; no Framework
+        # experimental loop is involved.
         assert MockChatHandler.request_count == 5
     finally:
         server.shutdown()
