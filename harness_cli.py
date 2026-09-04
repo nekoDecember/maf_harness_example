@@ -113,7 +113,7 @@ async def run_task(
     save_session(session, settings.checkpoint)
     runs_since_prompt = 0
 
-    while not task_is_complete(session):
+    while True:
         response = None
         for attempt in range(1, settings.api_retries + 1):
             try:
@@ -147,7 +147,8 @@ async def run_task(
             save_session(session, settings.checkpoint)
             continue
 
-        if task_is_complete(session):
+        open_items = await remaining_todos(todo_provider, session)
+        if task_is_complete(session) and not open_items:
             break
 
         current_mode = get_agent_mode(
@@ -177,13 +178,19 @@ async def run_task(
             save_session(session, settings.checkpoint)
             continue
 
-        open_items = await remaining_todos(todo_provider, session)
         titles = ", ".join(item.title for item in open_items) if open_items else "todo未作成または全件完了"
-        next_input = (
-            "The previous Framework run ended, but task_finish has not been called. "
-            "Continue the same task now; do not merely describe what remains. "
-            f"Current open todos: {titles}. If blocked on required user information, call ask_user."
-        )
+        if task_is_complete(session) and open_items:
+            next_input = (
+                "task_finish was called before all todos were verified. Continue the same task, complete the "
+                "remaining todos, and verify them; do not stop at the previous completion claim. "
+                f"Current open todos: {titles}."
+            )
+        else:
+            next_input = (
+                "The previous Framework run ended, but task_finish has not been called. "
+                "Continue the same task now; do not merely describe what remains. "
+                f"Current open todos: {titles}. If blocked on required user information, call ask_user."
+            )
         runs_since_prompt += 1
 
         if runs_since_prompt >= settings.supervisor_runs_before_prompt:
