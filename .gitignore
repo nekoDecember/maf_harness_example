@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.state/
+agent-file-memory/
+
+# Runtime files created by the agent. Keep only the directory guide.
+workspace/*
+!workspace/README.md
