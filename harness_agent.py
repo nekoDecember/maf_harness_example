@@ -12,12 +12,14 @@ from agent_framework import (
     Content,
     ContextProvider,
     FunctionTool,
+    FunctionInvocationContext,
     SessionContext,
     TodoProvider,
     create_harness_agent,
     tool,
 )
 from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
+from openai import AsyncOpenAI
 
 from harness_state import COMPLETION_SOURCE_ID, Settings
 
@@ -60,6 +62,8 @@ class CompletionProvider(ContextProvider):
         @tool(name="task_finish", approval_mode="never_require")
         def task_finish(summary: str) -> str:
             """Mark the current task complete after all requested work is verified."""
+            if not summary.strip():
+                return "Completion rejected: provide a non-empty verified result summary."
             state["done"] = True
             state["summary"] = summary.strip()
             return "The host recorded the task as complete. Return the final result to the user."
@@ -116,8 +120,10 @@ def make_workspace_tools(workspace: Path) -> list[Any]:
         return target.read_text(encoding="utf-8")
 
     @tool(name="workspace_write_text", approval_mode="always_require")
-    def workspace_write_text(path: str, content: str) -> str:
+    def workspace_write_text(ctx: FunctionInvocationContext, path: str, content: str) -> str:
         """Create or replace a UTF-8 text file; every call requires approval."""
+        if ctx.kwargs.get("host_mode") == "plan":
+            raise ValueError("File mutations are disabled in host plan mode.")
         target = resolve_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.tmp")
@@ -126,8 +132,10 @@ def make_workspace_tools(workspace: Path) -> list[Any]:
         return f"Wrote {len(content.encode('utf-8'))} bytes to {target.relative_to(root)}"
 
     @tool(name="workspace_delete", approval_mode="always_require")
-    def workspace_delete(path: str) -> str:
+    def workspace_delete(ctx: FunctionInvocationContext, path: str) -> str:
         """Delete one workspace file; every call requires approval."""
+        if ctx.kwargs.get("host_mode") == "plan":
+            raise ValueError("File mutations are disabled in host plan mode.")
         target = resolve_path(path)
         if not target.exists():
             return f"File not found: {path}"
@@ -165,8 +173,12 @@ def build_agent(settings: Settings) -> tuple[Any, TodoProvider, AgentModeProvide
     client_type = OpenAIChatCompletionClient if settings.client_kind == "chat_completions" else OpenAIChatClient
     client = client_type(
         model=settings.model,
-        api_key=settings.api_key,
-        base_url=settings.base_url,
+        async_client=AsyncOpenAI(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            max_retries=settings.api_retries - 1,
+            timeout=settings.request_timeout_seconds,
+        ),
         function_invocation_configuration={
             "enabled": True,
             "max_iterations": 80,

@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_framework import AgentSession
+from agent_framework import AgentSession, Content, Message
 
 
 REQUIRED_VERSIONS = {
@@ -33,6 +33,7 @@ class Settings:
     api_retries: int
     workspace: Path
     checkpoint: Path
+    request_timeout_seconds: int = 180
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -65,6 +66,7 @@ class Settings:
             api_retries=positive_int_env("MAF_API_RETRIES", 3),
             workspace=Path(os.getenv("MAF_WORKSPACE", "./workspace")).expanduser().resolve(),
             checkpoint=Path(os.getenv("MAF_CHECKPOINT", "./.state/session.json")).expanduser().resolve(),
+            request_timeout_seconds=positive_int_env("MAF_REQUEST_TIMEOUT_SECONDS", 180),
         )
 
 
@@ -108,6 +110,36 @@ def task_is_complete(session: AgentSession) -> bool:
 def begin_task(session: AgentSession, task: str) -> None:
     session.state[COMPLETION_SOURCE_ID] = {"done": False, "summary": ""}
     session.state[RUNNER_STATE_KEY] = {"active": True, "task": task}
+
+
+def save_next_input(session: AgentSession, value: str | list[Message]) -> None:
+    state = session.state.setdefault(RUNNER_STATE_KEY, {})
+    state["next_input"] = value if isinstance(value, str) else [item.to_dict() for item in value]
+    state["in_flight"] = False
+
+
+def load_next_input(session: AgentSession) -> str | list[Message] | None:
+    state = session.state.get(RUNNER_STATE_KEY, {})
+    if state.get("in_flight"):
+        return (
+            "The previous turn was interrupted and may have executed tools. Inspect current state "
+            "before continuing. Do not replay previous approvals or repeat completed mutations."
+        )
+    value = state.get("next_input")
+    if isinstance(value, list):
+        return [Message.from_dict(item) for item in value]
+    return value if isinstance(value, str) else None
+
+
+def pending_requests(session: AgentSession) -> list[Content]:
+    state = session.state.get(RUNNER_STATE_KEY, {})
+    return [Content.from_dict(item) for item in state.get("pending_requests", [])]
+
+
+def set_pending_requests(session: AgentSession, requests: list[Content]) -> None:
+    state = session.state.setdefault(RUNNER_STATE_KEY, {})
+    state["pending_requests"] = [item.to_dict() for item in requests]
+    state["in_flight"] = False
 
 
 def finish_task_state(session: AgentSession) -> None:
