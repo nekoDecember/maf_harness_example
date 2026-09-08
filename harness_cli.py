@@ -16,12 +16,17 @@ from harness_agent import build_agent
 from harness_state import (
     COMPLETION_SOURCE_ID,
     REQUIRED_VERSIONS,
+    RUNNER_STATE_KEY,
     Settings,
     active_task,
     begin_task,
     finish_task_state,
     load_session,
+    load_next_input,
+    pending_requests,
+    save_next_input,
     save_session,
+    set_pending_requests,
     task_is_complete,
     verify_framework_version,
 )
@@ -35,7 +40,13 @@ async def run_one_turn(agent: Any, session: AgentSession, agent_input: str | Seq
     and predictable boundary for this sample, so use the normal response path
     and let the host supervisor resume from there.
     """
-    response = await agent.run(agent_input, session=session)
+    response = await agent.run(
+        agent_input,
+        session=session,
+        function_invocation_kwargs={
+            "host_mode": session.state.get(RUNNER_STATE_KEY, {}).get("mode", "execute"),
+        },
+    )
     if response.text:
         print(response.text)
     return response
@@ -78,10 +89,7 @@ async def collect_user_responses(requests: Sequence[Content]) -> list[Message]:
             replies.append(Message("tool", [Content.from_function_result(request.call_id, result=answer)]))
             continue
 
-        print(f"\n[未対応の入力要求] type={request.type}")
-        answer = await asyncio.to_thread(input, "応答: ")
-        call_id = getattr(request, "call_id", None) or getattr(request, "id", None)
-        replies.append(Message("tool", [Content.from_function_result(call_id=call_id, result=answer)]))
+        raise ValueError(f"Unsupported input request: {request.type}")
     return replies
 
 
@@ -103,32 +111,71 @@ async def run_task(
     """Keep calling the stable single-turn Harness until task_finish is seen."""
     if not resume:
         begin_task(session, task)
+        session.state.pop(todo_provider.source_id, None)
         next_input: str | Sequence[Message] = task
     else:
-        next_input = (
+        if (
+            task_is_complete(session)
+            and not pending_requests(session)
+            and not session.state.get(RUNNER_STATE_KEY, {}).get("in_flight")
+            and not await remaining_todos(todo_provider, session)
+        ):
+            finish_task_state(session)
+            save_session(session, settings.checkpoint)
+            print("保存済みの完了結果を確認しました。")
+            return
+        next_input = load_next_input(session) or (
             "The previous process stopped while this task was unfinished. Resume from the persisted todos and "
             "history. Inspect current state, continue the work, and call task_finish only when verified complete."
         )
 
+    runner = session.state[RUNNER_STATE_KEY]
+    runner.setdefault("mode", get_agent_mode(
+        session, source_id=mode_provider.source_id,
+        default_mode=mode_provider.default_mode, available_modes=mode_provider.available_modes,
+    ))
     save_session(session, settings.checkpoint)
     runs_since_prompt = 0
 
     while True:
+        requests = pending_requests(session)
+        if requests:
+            # The exact call IDs are durable before collecting an answer.
+            next_input = await collect_user_responses(requests)
+            set_pending_requests(session, [])
+            save_next_input(session, list(next_input))
+            save_session(session, settings.checkpoint)
+
+        runner = session.state[RUNNER_STATE_KEY]
+        current_mode = runner["mode"]
+        set_agent_mode(
+            session, current_mode, source_id=mode_provider.source_id,
+            available_modes=mode_provider.available_modes,
+        )
+        save_next_input(session, next_input if isinstance(next_input, str) else list(next_input))
+        runner["in_flight"] = True
+        save_session(session, settings.checkpoint)
         response = None
-        for attempt in range(1, settings.api_retries + 1):
-            try:
-                print(f"\n--- host-supervised run {runs_since_prompt + 1} ---")
-                response = await run_one_turn(agent, session, next_input)
-                save_session(session, settings.checkpoint)
-                break
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                save_session(session, settings.checkpoint)
-                raise
-            except Exception as exc:  # Provider/network exception types vary by backend.
-                save_session(session, settings.checkpoint)
-                print(f"\n[APIエラー {attempt}/{settings.api_retries}] {type(exc).__name__}: {exc}")
-                if attempt < settings.api_retries:
-                    await asyncio.sleep(min(2 ** (attempt - 1), 8))
+        try:
+            print(f"\n--- host-supervised run {runs_since_prompt + 1} ---")
+            response = await run_one_turn(agent, session, next_input)
+            set_agent_mode(
+                session, current_mode, source_id=mode_provider.source_id,
+                available_modes=mode_provider.available_modes,
+            )
+            save_next_input(session, "Continue the same unfinished task from the saved history.")
+            set_pending_requests(session, list(response.user_input_requests))
+            save_session(session, settings.checkpoint)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            save_session(session, settings.checkpoint)
+            raise
+        except Exception as exc:
+            # HTTP retries belong inside the SDK. Re-running an entire tool turn
+            # can execute an already-approved mutation twice.
+            next_input = load_next_input(session) or "Inspect current state before continuing."
+            save_next_input(session, next_input)
+            save_session(session, settings.checkpoint)
+            print(f"\n[実行エラー] {type(exc).__name__}: {exc}")
 
         if response is None:
             action = (
@@ -143,20 +190,12 @@ async def run_task(
 
         # The Framework returns here for declaration-only questions and tool approvals.
         if response.user_input_requests:
-            next_input = await collect_user_responses(response.user_input_requests)
-            save_session(session, settings.checkpoint)
             continue
 
         open_items = await remaining_todos(todo_provider, session)
         if task_is_complete(session) and not open_items:
             break
 
-        current_mode = get_agent_mode(
-            session,
-            source_id=mode_provider.source_id,
-            default_mode=mode_provider.default_mode,
-            available_modes=mode_provider.available_modes,
-        )
         if current_mode.strip().lower() != "execute":
             print("\n[plan mode] 自律実行は停止中です。計画を確認してください。")
             action = (
@@ -168,6 +207,7 @@ async def run_task(
             if action == "f":
                 next_input = await asyncio.to_thread(input, "追加指示: ")
             else:
+                runner["mode"] = "execute"
                 set_agent_mode(
                     session,
                     "execute",
@@ -180,9 +220,10 @@ async def run_task(
 
         titles = ", ".join(item.title for item in open_items) if open_items else "todo未作成または全件完了"
         if task_is_complete(session) and open_items:
+            session.state[COMPLETION_SOURCE_ID] = {"done": False, "summary": ""}
             next_input = (
                 "task_finish was called before all todos were verified. Continue the same task, complete the "
-                "remaining todos, and verify them; do not stop at the previous completion claim. "
+                "remaining todos, verify them, and call task_finish again. The previous claim was rejected. "
                 f"Current open todos: {titles}."
             )
         else:
@@ -192,6 +233,8 @@ async def run_task(
                 f"Current open todos: {titles}. If blocked on required user information, call ask_user."
             )
         runs_since_prompt += 1
+        save_next_input(session, next_input)
+        save_session(session, settings.checkpoint)
 
         if runs_since_prompt >= settings.supervisor_runs_before_prompt:
             print(f"\n[安全確認] {runs_since_prompt}回のhost-supervised run後も未完了です。")

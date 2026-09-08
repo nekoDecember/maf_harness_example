@@ -4,6 +4,8 @@ Microsoft Agent FrameworkのHarness Agentを、experimentalなAgent Loop機能�
 実行可能なPython CLIです。通常のFramework tool loopと、短いホスト側supervisorを組み合わせています。
 LiteLLMを含むOpenAI互換Chat Completions、またはOpenAI Responses APIに接続できます。
 
+再開・終了・再試行の詳細は[ワークフロー設計](WORKFLOW.md)を参照してください。
+
 ## 方針
 
 1回の `agent.run()` が通常のテキスト応答で終わっても、`task_finish` が呼ばれていなければ
@@ -15,7 +17,7 @@ LiteLLMを含むOpenAI互換Chat Completions、またはOpenAI Responses APIに�
 - 未完了なら次のFramework turnを呼ぶ
 - `ask_user` とtool approvalで停止し、回答後に再開する
 - 毎turn checkpointを保存する
-- 一時的なAPIエラーを再試行する
+- 一時的なAPIエラーはSDKのHTTP要求単位で再試行する
 - 長時間未完了のときだけユーザーへ続行確認する
 
 ## バージョン
